@@ -31,5 +31,7 @@ class EodBatchIntegrationTest {
         assertTrue(out.contains("invalid date"));
         assertTrue(out.contains("balanced=true"));
         assertTrue(out.contains("BREAK WTI_NYMEX"));
+        assertTrue(out.contains("12. Gas scheduling"));
+        assertTrue(out.contains("Re-nominate: market deal"));
     }
 }

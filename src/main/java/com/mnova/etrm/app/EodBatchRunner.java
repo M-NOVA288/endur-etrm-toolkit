@@ -15,6 +15,12 @@ import com.mnova.etrm.ops.StandardRules;
 import com.mnova.etrm.risk.CreditExposure;
 import com.mnova.etrm.risk.HistoricalVaR;
 import com.mnova.etrm.risk.PositionReport;
+import com.mnova.etrm.scheduling.DealLocation;
+import com.mnova.etrm.scheduling.ImbalanceCalculator;
+import com.mnova.etrm.scheduling.Nomination;
+import com.mnova.etrm.scheduling.NominationCycle;
+import com.mnova.etrm.scheduling.NominationService;
+import com.mnova.etrm.scheduling.ScheduleBuilder;
 import com.mnova.etrm.settlement.Cashflow;
 import com.mnova.etrm.settlement.CashflowGenerator;
 import com.mnova.etrm.settlement.InvoiceService;
@@ -25,6 +31,8 @@ import com.mnova.etrm.valuation.ValuationResult;
 import java.io.FileReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.YearMonth;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,7 +42,8 @@ import java.util.Set;
 /**
  * End-of-day batch, wiring every component together the way an Endur EOD workflow would:
  * trade feed load -> ops validation -> confirmations -> valuation -> positions/VaR/credit
- * -> settlements/invoices -> GL extract -> broker reconciliation -> maturity -> P&amp;L explain.
+ * -> settlements/invoices -> GL extract -> broker reconciliation -> maturity -> P&amp;L explain
+ * -> gas scheduling (nominations, pipeline confirmations, imbalances).
  *
  * <p>Usage: {@code java -jar endur-etrm-toolkit.jar [trades.csv]} (defaults to the bundled sample).</p>
  */
@@ -157,7 +166,62 @@ public final class EodBatchRunner {
         System.out.printf("  new deals %,14.0f%n  time      %,14.0f%n  market    %,14.0f%n  total     %,14.0f%n",
                 ex.newDeals(), ex.time(), ex.market(), ex.total());
 
+        // 12. Gas scheduling for the first November gas day --------------------------------
+        runScheduling(session);
+
         banner("EOD COMPLETE");
+    }
+
+    private static void runScheduling(EndurSession session) {
+        LocalDate gasDay = LocalDate.of(2026, 11, 1);
+        section("12. Gas scheduling  gas day " + gasDay + " (pipeline GULF_STAR)");
+        List<DealLocation> locations = new ArrayList<>();
+        SampleEnvironment.pointByExternalRef().forEach((ref, point) ->
+                session.findByExternalRef(ref).ifPresent(d -> locations.add(new DealLocation(d.dealTrackingNum(), point))));
+
+        ScheduleBuilder builder = new ScheduleBuilder(SampleEnvironment.pipelinePoints(), SampleEnvironment.transportContracts());
+        ScheduleBuilder.ScheduleResult schedule = builder.build(gasDay, NominationCycle.TIMELY,
+                session.query(d -> d.status().isLive()), locations);
+        System.out.printf("  %-24s %-10s %-10s %-16s %8s %8s %10s%n", "Nomination", "Contract", "Receipt", "Delivery",
+                "Supply", "Market", "Rec/Del");
+        for (Nomination n : schedule.nominations()) {
+            System.out.printf("  %-24s %-10s %-10s %-16s %8d %8d %,5.0f/%,5.0f%n", n.id(), n.contractId(), n.receiptPoint(),
+                    n.deliveryPoint(), n.supplyDeal(), n.marketDeal(), n.receiptVolume(), n.deliveryVolume());
+        }
+        schedule.unmatchedSupply().forEach((deal, v) -> System.out.printf("  Unmatched supply: deal %d %,.0f MMBtu (sell spot or store)%n", deal, v));
+        schedule.unmatchedMarket().forEach((deal, v) -> System.out.printf("  Unmatched market: deal %d %,.0f MMBtu (buy spot)%n", deal, v));
+        schedule.warnings().forEach(w -> System.out.println("  WARN " + w));
+
+        NominationService noms = new NominationService();
+        NominationService.SubmitResult late = noms.submit(schedule.nominations(), NominationCycle.TIMELY,
+                LocalDateTime.of(2026, 10, 31, 13, 5));
+        System.out.println("  Submit at 13:05 for Timely: " + late.rejections().size() + " rejected, e.g. "
+                + (late.rejections().isEmpty() ? "-" : late.rejections().get(0)));
+        NominationService.SubmitResult sub = noms.submit(schedule.nominations(), NominationCycle.TIMELY,
+                LocalDateTime.of(2026, 10, 31, 11, 30));
+        System.out.println("  Submit at 11:30 for Timely: " + sub.accepted().size() + " accepted");
+
+        Map<String, Double> conf = noms.allocateConstraint(sub.accepted(), "GS-R-KATY", 11_000, builder::contract);
+        List<Nomination> confirmed = noms.confirm(sub.accepted(), conf);
+        System.out.println("  Pipeline constraint at GS-R-KATY: 11,000 available");
+        for (Nomination n : confirmed) {
+            System.out.printf("    %-24s %-9s scheduled %,8.0f of %,8.0f%s%n", n.id(), n.status(), n.scheduledVolume(),
+                    n.receiptVolume(), n.cutVolume() > 0 ? String.format("  cut %,.0f", n.cutVolume()) : "");
+        }
+        noms.marketShortfall(confirmed, builder::contract).forEach((deal, v) ->
+                System.out.printf("  Re-nominate: market deal %d short %,.0f MMBtu -> source replacement supply in EVENING cycle%n", deal, v));
+        System.out.printf("  Transport cost: $%,.2f%n", noms.transportCost(confirmed, builder::contract));
+
+        ImbalanceCalculator imb = new ImbalanceCalculator(0.05, 0.10);
+        double scheduledDelivery = confirmed.stream()
+                .mapToDouble(n -> Math.floor(builder.contract(n.contractId()).delivered(n.scheduledVolume()))).sum();
+        System.out.println("  Imbalances (index $3.40):");
+        for (double[] actual : new double[][]{{10_950, 10_700}, {10_950, 12_100}}) {
+            ImbalanceCalculator.Result r = imb.calculate(new ImbalanceCalculator.Input("GULF_STAR", gasDay,
+                    scheduledDelivery, actual[0], actual[1], 0.015), 3.40);
+            System.out.printf("    actual rec %,.0f del %,.0f -> %s %,.0f (%.1f%%) %s cash-out %,.2f%n", actual[0], actual[1],
+                    r.direction(), Math.abs(r.imbalance()), r.percent() * 100, r.tier(), r.cashoutAmount());
+        }
     }
 
     private static void banner(String s) {
